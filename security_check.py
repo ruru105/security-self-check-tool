@@ -62,10 +62,17 @@ def run_bandit(target: str) -> list:
         # banditは問題を検出すると exit code 1 を返すため、stdoutのJSONを優先して読む
         data = json.loads(proc.stdout) if proc.stdout.strip() else {"results": []}
     except FileNotFoundError:
-        print("警告: bandit が見つかりません。pip install bandit でインストールしてください。")
-        return []
-    except (json.JSONDecodeError, subprocess.TimeoutExpired):
-        return []
+        msg = "bandit が見つかりません(pip install bandit でインストールしてください)"
+        print(f"警告: {msg}")
+        return [], msg
+    except subprocess.TimeoutExpired:
+        msg = "bandit の実行がタイムアウトしました"
+        print(f"警告: {msg}")
+        return [], msg
+    except json.JSONDecodeError:
+        msg = "bandit の出力を読み取れませんでした(実行時にエラーが発生した可能性があります)"
+        print(f"警告: {msg}")
+        return [], msg
 
     findings = []
     sev_map = {"HIGH": "critical", "MEDIUM": "warning", "LOW": "info"}
@@ -78,11 +85,13 @@ def run_bandit(target: str) -> list:
             "内容": r.get("issue_text", ""),
             "ルールID": r.get("test_id", ""),
         })
-    return findings
+    return findings, None
 
 
-def run_pip_audit(target: str) -> list:
-    """pip-audit を実行し、依存ライブラリの既知脆弱性(CVE)を検出する。"""
+def run_pip_audit(target: str) -> tuple:
+    """pip-audit を実行し、依存ライブラリの既知脆弱性(CVE)を検出する。
+    戻り値: (findings, エラーメッセージまたはNone)
+    """
     req_file = None
     for name in ("requirements.txt", "requirements-prod.txt"):
         candidate = Path(target) / name
@@ -90,7 +99,8 @@ def run_pip_audit(target: str) -> list:
             req_file = candidate
             break
     if req_file is None:
-        return []
+        # requirements.txt が無いのは「対象外」であって「失敗」ではない
+        return [], None
 
     try:
         proc = subprocess.run(
@@ -99,10 +109,17 @@ def run_pip_audit(target: str) -> list:
         )
         data = json.loads(proc.stdout) if proc.stdout.strip() else {"dependencies": []}
     except FileNotFoundError:
-        print("警告: pip-audit が見つかりません。pip install pip-audit でインストールしてください。")
-        return []
-    except (json.JSONDecodeError, subprocess.TimeoutExpired):
-        return []
+        msg = "pip-audit が見つかりません(pip install pip-audit でインストールしてください)"
+        print(f"警告: {msg}")
+        return [], msg
+    except subprocess.TimeoutExpired:
+        msg = "pip-audit の実行がタイムアウトしました"
+        print(f"警告: {msg}")
+        return [], msg
+    except json.JSONDecodeError:
+        msg = "pip-audit の出力を読み取れませんでした(実行時にエラーが発生した可能性があります)"
+        print(f"警告: {msg}")
+        return [], msg
 
     findings = []
     seen = set()  # pip-audit は同じIDの脆弱性情報が複数DBから重複して返ることがあるため、重複を除く
@@ -120,11 +137,13 @@ def run_pip_audit(target: str) -> list:
                 "内容": f"{dep['name']} {dep['version']} に既知の脆弱性 {vuln.get('id', '')}",
                 "ルールID": vuln.get("id", ""),
             })
-    return findings
+    return findings, None
 
 
-def run_detect_secrets(target: str) -> list:
-    """detect-secrets を実行し、APIキー等のハードコードを検出する。"""
+def run_detect_secrets(target: str) -> tuple:
+    """detect-secrets を実行し、APIキー等のハードコードを検出する。
+    戻り値: (findings, エラーメッセージまたはNone)
+    """
     try:
         proc = subprocess.run(
             # --all-files を付けないと、gitで管理されていないファイルがスキップされてしまう
@@ -133,10 +152,17 @@ def run_detect_secrets(target: str) -> list:
         )
         data = json.loads(proc.stdout) if proc.stdout.strip() else {"results": {}}
     except FileNotFoundError:
-        print("警告: detect-secrets が見つかりません。pip install detect-secrets でインストールしてください。")
-        return []
-    except (json.JSONDecodeError, subprocess.TimeoutExpired):
-        return []
+        msg = "detect-secrets が見つかりません(pip install detect-secrets でインストールしてください)"
+        print(f"警告: {msg}")
+        return [], msg
+    except subprocess.TimeoutExpired:
+        msg = "detect-secrets の実行がタイムアウトしました"
+        print(f"警告: {msg}")
+        return [], msg
+    except json.JSONDecodeError:
+        msg = "detect-secrets の出力を読み取れませんでした(実行時にエラーが発生した可能性があります)"
+        print(f"警告: {msg}")
+        return [], msg
 
     findings = []
     for filename, items in data.get("results", {}).items():
@@ -149,34 +175,48 @@ def run_detect_secrets(target: str) -> list:
                 "内容": f"秘密情報らしき値を検出({item.get('type', '')})。誤検知の可能性もあります",
                 "ルールID": item.get("type", ""),
             })
-    return findings
+    return findings, None
 
 
 def build_report(target: str, out_path: str):
     print(f"検査対象: {target}")
+    errors = []
+
     print("bandit (コードの危険なパターン) を実行中...")
-    findings = run_bandit(target)
+    findings, err = run_bandit(target)
+    if err:
+        errors.append(("bandit", err))
     print(f"  → {len(findings)} 件")
 
     print("pip-audit (依存ライブラリの既知脆弱性) を実行中...")
-    pa = run_pip_audit(target)
+    pa, err = run_pip_audit(target)
+    if err:
+        errors.append(("pip-audit", err))
     findings += pa
     print(f"  → {len(pa)} 件")
 
     print("detect-secrets (秘密情報の直書き) を実行中...")
-    ds = run_detect_secrets(target)
+    ds, err = run_detect_secrets(target)
+    if err:
+        errors.append(("detect-secrets", err))
     findings += ds
     print(f"  → {len(ds)} 件")
 
+    if errors:
+        print("\n⚠ 以下のチェックは実行できませんでした:")
+        for tool, msg in errors:
+            print(f"  - {tool}: {msg}")
+
     wb = Workbook()
-    _write_summary_sheet(wb, target, findings)
+    _write_summary_sheet(wb, target, findings, errors)
     _write_findings_sheet(wb, findings)
     _write_checklist_sheet(wb)
     wb.save(out_path)
     print(f"\nレポートを作成しました: {out_path}")
 
 
-def _write_summary_sheet(wb, target, findings):
+def _write_summary_sheet(wb, target, findings, errors=None):
+    errors = errors or []
     ws = wb.active
     ws.title = "検査結果サマリー"
     ws.append(["セキュリティ公開前チェック結果"])
@@ -198,8 +238,22 @@ def _write_summary_sheet(wb, target, findings):
         ws.cell(row=ws.max_row, column=1).fill = SEV_FILL[sev]
 
     ws.append([])
-    ws.append(["総合判定",
-               "要確認(自動チェックで検出あり)" if sum(counts.values()) else "自動チェックでは検出なし"])
+    if errors:
+        judge = "⚠ 一部のチェックが実行できませんでした(下記参照・手動で確認してください)"
+    elif sum(counts.values()):
+        judge = "要確認(自動チェックで検出あり)"
+    else:
+        judge = "自動チェックでは検出なし"
+    ws.append(["総合判定", judge])
+
+    if errors:
+        ws.append([])
+        ws.append(["実行できなかったチェック"])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
+        for tool, msg in errors:
+            ws.append([tool, msg])
+            ws.cell(row=ws.max_row, column=1).fill = SEV_FILL["critical"]
+
     ws.append([])
     ws.append(["※ このツールの結論はあくまで「自動チェックでの気づき」です。"])
     ws.append(["　 最終判断はご自身で行ってください。誤検知・見落としの可能性があります。"])
