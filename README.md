@@ -1,6 +1,6 @@
 # 作品6:セキュリティ公開前チェックツール(Security Self-Check Tool)
 
-[![tests](https://github.com/ruru105/security-self-check-tool/actions/workflows/tests.yml/badge.svg)](https://github.com/ruru105/security-self-check-tool/actions/workflows/tests.yml)
+[![tests](https://github.com/ruru105/work6-security-self-check-tool/actions/workflows/tests.yml/badge.svg)](https://github.com/ruru105/work6-security-self-check-tool/actions/workflows/tests.yml)
 
 AIにコードを書いてもらった(いわゆる「バイブコーディング」)あと、公開・納品する前に「最低限ここだけは確認しよう」というセルフチェックを行うPythonツールです。
 
