@@ -24,6 +24,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -50,8 +51,10 @@ SEV_LABEL_JA = {
 }
 
 
-def run_bandit(target: str) -> list:
-    """bandit を実行し、Python コードの危険なパターンを検出する。"""
+def run_bandit(target: str) -> tuple:
+    """bandit を実行し、Python コードの危険なパターンを検出する。
+    戻り値: (findings, エラーメッセージまたはNone)
+    """
     # テストコード(test_*.py等)はassert多用などでノイズが多いため対象から除外する
     exclude = "*/test_*.py,*test_*.py,*/*_test.py,*_test.py,*/tests/*,*/conftest.py"
     try:
@@ -88,8 +91,38 @@ def run_bandit(target: str) -> list:
     return findings, None
 
 
+def requirements_from_pyproject(pyproject_path: Path) -> list:
+    """pyproject.toml から依存ライブラリの指定を取り出し、requirements.txt 形式の行のリストにする。
+
+    - PEP 621形式([project] の dependencies / optional-dependencies)はそのまま使う
+    - Poetry形式([tool.poetry.dependencies])は、^ や ~ などpip非対応の書き方があるため
+      ライブラリ名だけを使う(=最新版として検査する。実際の固定バージョンは poetry.lock 側にある)
+    """
+    try:
+        import tomllib  # Python 3.11以降
+    except ModuleNotFoundError:
+        import tomli as tomllib  # Python 3.10用(requirements.txtに記載)
+
+    data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    lines = []
+    project = data.get("project", {}) or {}
+    lines += [str(d) for d in (project.get("dependencies") or [])]
+    for group in (project.get("optional-dependencies") or {}).values():
+        lines += [str(d) for d in (group or [])]
+
+    poetry = (data.get("tool", {}) or {}).get("poetry", {}) or {}
+    for name, spec in (poetry.get("dependencies") or {}).items():
+        if name.lower() == "python":
+            continue
+        if isinstance(spec, dict) and any(k in spec for k in ("git", "path", "url")):
+            continue  # PyPI以外の指定は検査対象外
+        lines.append(name)
+    return lines
+
+
 def run_pip_audit(target: str) -> tuple:
     """pip-audit を実行し、依存ライブラリの既知脆弱性(CVE)を検出する。
+    requirements.txt を優先し、無ければ pyproject.toml の依存指定を検査する。
     戻り値: (findings, エラーメッセージまたはNone)
     """
     req_file = None
@@ -98,10 +131,37 @@ def run_pip_audit(target: str) -> tuple:
         if candidate.exists():
             req_file = candidate
             break
-    if req_file is None:
-        # requirements.txt が無いのは「対象外」であって「失敗」ではない
-        return [], None
 
+    temp_dir = None
+    if req_file is None:
+        pyproject = Path(target) / "pyproject.toml"
+        if not pyproject.exists():
+            # 依存関係ファイルが無いのは「対象外」であって「失敗」ではない
+            return [], None
+        try:
+            lines = requirements_from_pyproject(pyproject)
+        except Exception as e:  # tomlの書式エラーなど
+            msg = f"pyproject.toml を読み取れませんでした({e})"
+            print(f"警告: {msg}")
+            return [], msg
+        if not lines:
+            return [], None
+        temp_dir = tempfile.TemporaryDirectory()
+        req_file = Path(temp_dir.name) / "requirements-from-pyproject.txt"
+        req_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        display_name = "pyproject.toml"
+    else:
+        display_name = req_file.name
+
+    try:
+        return _run_pip_audit_on(req_file, display_name)
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+
+def _run_pip_audit_on(req_file: Path, display_name: str) -> tuple:
+    """requirements形式のファイルに pip-audit を実行し、結果を整形する。"""
     try:
         proc = subprocess.run(
             ["pip-audit", "-r", str(req_file), "-f", "json"],
@@ -125,16 +185,16 @@ def run_pip_audit(target: str) -> tuple:
     seen = set()  # pip-audit は同じIDの脆弱性情報が複数DBから重複して返ることがあるため、重複を除く
     for dep in data.get("dependencies", []):
         for vuln in dep.get("vulns", []):
-            key = (dep["name"], dep["version"], vuln.get("id", ""))
+            key = (dep.get("name", ""), dep.get("version", ""), vuln.get("id", ""))
             if key in seen:
                 continue
             seen.add(key)
             findings.append({
                 "ツール": "pip-audit",
                 "重要度": "critical",
-                "ファイル": req_file.name,
+                "ファイル": display_name,
                 "行": "",
-                "内容": f"{dep['name']} {dep['version']} に既知の脆弱性 {vuln.get('id', '')}",
+                "内容": f"{dep.get('name', '')} {dep.get('version', '')} に既知の脆弱性 {vuln.get('id', '')}",
                 "ルールID": vuln.get("id", ""),
             })
     return findings, None
@@ -257,7 +317,7 @@ def _write_summary_sheet(wb, target, findings, errors=None):
     ws.append([])
     ws.append(["※ このツールの結論はあくまで「自動チェックでの気づき」です。"])
     ws.append(["　 最終判断はご自身で行ってください。誤検知・見落としの可能性があります。"])
-    ws.append(["　 自動チェックの対象は Python コードと requirements.txt のみです。"])
+    ws.append(["　 自動チェックの対象は Python コードと、requirements.txt または pyproject.toml の依存指定です。"])
 
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 50
