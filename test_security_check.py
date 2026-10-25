@@ -47,10 +47,10 @@ from openpyxl import Workbook
 import security_check
 
 
-def _fake_run(stdout):
+def _fake_run(stdout, returncode=1):
     """subprocess.run の代わりに、決まったJSONを返す関数を作る。"""
     def fake(cmd, **kwargs):
-        return SimpleNamespace(stdout=json.dumps(stdout), returncode=1)
+        return SimpleNamespace(stdout=json.dumps(stdout), returncode=returncode)
     return fake
 
 
@@ -141,7 +141,7 @@ def test_pip_audit_uses_pyproject_when_no_requirements(monkeypatch, tmp_path):
 
 def test_detect_secrets_parses_results(monkeypatch):
     out = {"results": {"app.py": [{"line_number": 5, "type": "Secret Keyword"}]}}
-    monkeypatch.setattr(security_check.subprocess, "run", _fake_run(out))
+    monkeypatch.setattr(security_check.subprocess, "run", _fake_run(out, returncode=0))
     findings, err = security_check.run_detect_secrets("dummy")
     assert err is None
     assert findings[0]["重要度"] == "warning"
