@@ -51,6 +51,31 @@ SEV_LABEL_JA = {
 }
 
 
+def _read_scan_result(proc, tool, key, expected_type, allowed_codes):
+    """終了コードと結果の形を確認する。空・不正な出力を検出ゼロに置き換えない。"""
+    if proc.returncode not in allowed_codes:
+        return None, f"{tool} が異常終了しました(終了コード {proc.returncode})"
+    if not proc.stdout.strip():
+        return None, f"{tool} の検査結果が空です(検査の完了を確認できません)"
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None, f"{tool} の出力を読み取れませんでした(JSON形式ではありません)"
+    if not isinstance(data, dict) or not isinstance(data.get(key), expected_type):
+        return None, f"{tool} の出力に必要な検査結果がありません({key}の形式が不正)"
+    entries = data[key]
+    if expected_type is list:
+        valid_entries = all(isinstance(item, dict) for item in entries)
+    else:
+        valid_entries = all(
+            isinstance(items, list) and all(isinstance(item, dict) for item in items)
+            for items in entries.values()
+        )
+    if not valid_entries:
+        return None, f"{tool} の検査結果の項目形式が不正です"
+    return data, None
+
+
 def run_bandit(target: str) -> tuple:
     """bandit を実行し、Python コードの危険なパターンを検出する。
     戻り値: (findings, エラーメッセージまたはNone)
@@ -62,8 +87,6 @@ def run_bandit(target: str) -> tuple:
             ["bandit", "-r", target, "-f", "json", "-q", "-x", exclude],
             capture_output=True, text=True, timeout=300,
         )
-        # banditは問題を検出すると exit code 1 を返すため、stdoutのJSONを優先して読む
-        data = json.loads(proc.stdout) if proc.stdout.strip() else {"results": []}
     except FileNotFoundError:
         msg = "bandit が見つかりません(pip install bandit でインストールしてください)"
         print(f"警告: {msg}")
@@ -72,10 +95,10 @@ def run_bandit(target: str) -> tuple:
         msg = "bandit の実行がタイムアウトしました"
         print(f"警告: {msg}")
         return [], msg
-    except json.JSONDecodeError:
-        msg = "bandit の出力を読み取れませんでした(実行時にエラーが発生した可能性があります)"
-        print(f"警告: {msg}")
-        return [], msg
+    # 1は「指摘あり」であり、実行失敗の2等とは区別する。
+    data, err = _read_scan_result(proc, "bandit", "results", list, (0, 1))
+    if err:
+        return [], err
 
     findings = []
     sev_map = {"HIGH": "critical", "MEDIUM": "warning", "LOW": "info"}
@@ -88,6 +111,10 @@ def run_bandit(target: str) -> tuple:
             "内容": r.get("issue_text", ""),
             "ルールID": r.get("test_id", ""),
         })
+    if data.get("errors"):
+        return findings, "bandit で一部のファイルを検査できませんでした"
+    if proc.returncode == 1 and not findings:
+        return [], "bandit の終了コード1に対応する検出内容がありません"
     return findings, None
 
 
@@ -167,7 +194,6 @@ def _run_pip_audit_on(req_file: Path, display_name: str) -> tuple:
             ["pip-audit", "-r", str(req_file), "-f", "json"],
             capture_output=True, text=True, timeout=300,
         )
-        data = json.loads(proc.stdout) if proc.stdout.strip() else {"dependencies": []}
     except FileNotFoundError:
         msg = "pip-audit が見つかりません(pip install pip-audit でインストールしてください)"
         print(f"警告: {msg}")
@@ -176,15 +202,22 @@ def _run_pip_audit_on(req_file: Path, display_name: str) -> tuple:
         msg = "pip-audit の実行がタイムアウトしました"
         print(f"警告: {msg}")
         return [], msg
-    except json.JSONDecodeError:
-        msg = "pip-audit の出力を読み取れませんでした(実行時にエラーが発生した可能性があります)"
-        print(f"警告: {msg}")
-        return [], msg
+    # 1は既知の脆弱性の検出時にも使われる。結果の内容も合わせて確認する。
+    data, err = _read_scan_result(proc, "pip-audit", "dependencies", list, (0, 1))
+    if err:
+        return [], err
 
     findings = []
+    skipped = False
     seen = set()  # pip-audit は同じIDの脆弱性情報が複数DBから重複して返ることがあるため、重複を除く
     for dep in data.get("dependencies", []):
-        for vuln in dep.get("vulns", []):
+        if dep.get("skip_reason"):
+            skipped = True
+            continue
+        vulns = dep.get("vulns")
+        if not isinstance(vulns, list) or not all(isinstance(v, dict) for v in vulns):
+            return [], "pip-audit の依存ライブラリの検査結果が不正です"
+        for vuln in vulns:
             key = (dep.get("name", ""), dep.get("version", ""), vuln.get("id", ""))
             if key in seen:
                 continue
@@ -197,6 +230,10 @@ def _run_pip_audit_on(req_file: Path, display_name: str) -> tuple:
                 "内容": f"{dep.get('name', '')} {dep.get('version', '')} に既知の脆弱性 {vuln.get('id', '')}",
                 "ルールID": vuln.get("id", ""),
             })
+    if skipped:
+        return findings, "pip-audit で検査できなかった依存ライブラリがあります"
+    if proc.returncode == 1 and not findings:
+        return [], "pip-audit の終了コード1に対応する検出内容がありません"
     return findings, None
 
 
@@ -210,7 +247,6 @@ def run_detect_secrets(target: str) -> tuple:
             ["detect-secrets", "scan", "--all-files", target],
             capture_output=True, text=True, timeout=300,
         )
-        data = json.loads(proc.stdout) if proc.stdout.strip() else {"results": {}}
     except FileNotFoundError:
         msg = "detect-secrets が見つかりません(pip install detect-secrets でインストールしてください)"
         print(f"警告: {msg}")
@@ -219,10 +255,10 @@ def run_detect_secrets(target: str) -> tuple:
         msg = "detect-secrets の実行がタイムアウトしました"
         print(f"警告: {msg}")
         return [], msg
-    except json.JSONDecodeError:
-        msg = "detect-secrets の出力を読み取れませんでした(実行時にエラーが発生した可能性があります)"
-        print(f"警告: {msg}")
-        return [], msg
+    # scanコマンドは、秘密情報が見つかった場合も正常完了なら0を返す。
+    data, err = _read_scan_result(proc, "detect-secrets", "results", dict, (0,))
+    if err:
+        return [], err
 
     findings = []
     for filename, items in data.get("results", {}).items():
@@ -269,7 +305,7 @@ def build_report(target: str, out_path: str):
 
     wb = Workbook()
     _write_summary_sheet(wb, target, findings, errors)
-    _write_findings_sheet(wb, findings)
+    _write_findings_sheet(wb, findings, errors)
     _write_checklist_sheet(wb)
     wb.save(out_path)
     print(f"\nレポートを作成しました: {out_path}")
@@ -323,7 +359,7 @@ def _write_summary_sheet(wb, target, findings, errors=None):
     ws.column_dimensions["B"].width = 50
 
 
-def _write_findings_sheet(wb, findings):
+def _write_findings_sheet(wb, findings, errors=None):
     ws = wb.create_sheet("自動チェック結果")
     headers = ["重要度", "ツール", "ファイル", "行", "内容", "ルールID"]
     ws.append(headers)
@@ -332,7 +368,9 @@ def _write_findings_sheet(wb, findings):
         cell.font = HEADER_FONT
 
     if not findings:
-        ws.append(["—", "—", "—", "—", "自動チェックでは指摘事項は見つかりませんでした", "—"])
+        message = ("チェック未完了のため、指摘の有無は判断できません(検査結果サマリー参照)"
+                   if errors else "自動チェックでは指摘事項は見つかりませんでした")
+        ws.append(["—", "—", "—", "—", message, "—"])
     else:
         # 重要度順(critical→warning→info)に並べる
         order = {"critical": 0, "warning": 1, "info": 2}
